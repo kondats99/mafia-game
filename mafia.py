@@ -56,7 +56,8 @@ C_GREY   = 6
 C_GOLD   = 7
 C_HEADER = 8
 C_INPUT  = 9
-C_DIM    = 10
+C_DIM         = 10
+C_SHERIFF_GOLD = 11   # golden yellow for sheriff
 
 # Roles
 ROLE_VILLAGER = "Villager"
@@ -89,7 +90,7 @@ class GameState:
         self.settings           = {"sheriff": True, "doctor": True}
         self.host_pid           = None
         self.messages           = []
-        self.votes              = {}   # pid -> target_pid (can be None for skip)
+        self.votes              = {}   # pid -> target_pid
         self.night_acts         = {}   # pid -> {type, target}
         self.mafia_pids         = []
         self.winner             = None
@@ -97,7 +98,8 @@ class GameState:
         self.last_saved         = False
         self.sheriff_results    = {}   # sheriff_pid -> {target_pid: bool}
         self.doc_last_protected = None
-        self.night_processed    = False  # Prevent double night resolution
+        self.night_resolving    = False   # countdown in progress
+        self.night_countdown    = 0       # seconds remaining (0 = not counting)
 
     def to_dict(self, viewer_pid=None):
         viewer       = self.players.get(viewer_pid, {})
@@ -131,7 +133,9 @@ class GameState:
             "last_killed":   self.last_killed,
             "last_saved":    self.last_saved,
             "sheriff_log":   sheriff_log,
-            "doc_last_prot": self.doc_last_protected,
+            "doc_last_prot":    self.doc_last_protected,
+            "night_countdown":  getattr(self, "night_countdown", 0),
+            "night_resolving":  getattr(self, "night_resolving", False),
         }
 
     def _visible_role(self, pid, viewer_pid, viewer_role, viewer_alive):
@@ -198,7 +202,7 @@ class MafiaServer:
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("0.0.0.0", self.port))
-        srv.listen(12)
+        srv.listen(20)
         srv.settimeout(1.0)
         while self.running:
             try:
@@ -247,8 +251,14 @@ class MafiaServer:
                 if self.gs.phase != PHASE_LOBBY:
                     self._send(conn, {"type": "error", "text": "Game already started."})
                     return pid
-                if len(self.gs.players) >= 12:
-                    self._send(conn, {"type": "error", "text": "Session full (max 12)."})
+                if len(self.gs.players) >= 20:
+                    self._send(conn, {"type": "error", "text": "Session full (max 20)."})
+                    return pid
+                # Reject duplicate names
+                existing_names = [p["name"].lower() for p in self.gs.players.values()]
+                if name.lower() in existing_names:
+                    self._send(conn, {"type": "error",
+                        "text": "Name '" + name + "' is already taken. Please choose a different name."})
                     return pid
                 is_host = len(self.gs.players) == 0
                 self.gs.players[pid] = {"pid": pid, "name": name, "role": None, "alive": True}
@@ -334,20 +344,20 @@ class MafiaServer:
                 voter = self.gs.players.get(pid)
                 if not voter or not voter["alive"]:
                     return pid
-                # Allow None for skip vote, or a valid alive player
-                if target is None:
-                    self.gs.votes[pid] = None
-                elif target in self.gs.players and self.gs.players[target]["alive"]:
+                if target == "SKIP":
+                    self.gs.votes[pid] = "SKIP"
+                elif target and target in self.gs.players and self.gs.players[target]["alive"]:
                     self.gs.votes[pid] = target
-                else:
-                    return pid
+                elif target is None:
+                    self.gs.votes.pop(pid, None)
             self._broadcast_state()
             self._check_day_resolution()
             return pid
 
         if t == "night_action" and self.gs.phase == PHASE_NIGHT:
-            target = msg.get("target")
-            action = msg.get("action")
+            target     = msg.get("target")
+            action     = msg.get("action")
+            do_resolve = False
             with self.gs.lock:
                 actor = self.gs.players.get(pid)
                 if not actor or not actor["alive"]:
@@ -356,24 +366,34 @@ class MafiaServer:
                 valid = {ROLE_MAFIA: "kill", ROLE_SHERIFF: "investigate", ROLE_DOCTOR: "protect"}
                 if action != valid.get(role):
                     return pid
-                # Sheriff cannot change their investigation once submitted
+                # Sheriff cannot re-investigate once submitted
                 if role == ROLE_SHERIFF and pid in self.gs.night_acts:
                     self._send(conn, {"type": "error",
                         "text": "You have already investigated someone tonight."})
                     return pid
                 if target and target in self.gs.players and self.gs.players[target]["alive"]:
+                    if role == ROLE_MAFIA and target in self.gs.mafia_pids:
+                        self._send(conn, {"type": "error",
+                            "text": "You can't kill a teammate."})
+                        return pid
                     if role == ROLE_DOCTOR and target == self.gs.doc_last_protected:
                         self._send(conn, {"type": "error",
                             "text": "Can't protect the same person two nights in a row."})
                         return pid
                     self.gs.night_acts[pid] = {"type": action, "target": target}
-                elif target is None:
-                    # Sheriff can't un-investigate; mafia/doctor can change their mind
+                    do_resolve = True
+                    # Sheriff: immediately record result and prepare personal notification
                     if role == ROLE_SHERIFF:
-                        return pid
+                        is_m = target in self.gs.mafia_pids
+                        self.gs.sheriff_results.setdefault(pid, {})[target] = is_m
+                elif target is None:
+                    if role == ROLE_SHERIFF:
+                        return pid  # sheriff can't un-investigate
                     self.gs.night_acts.pop(pid, None)
+            # Broadcast and resolve OUTSIDE the lock to prevent deadlock
             self._broadcast_state()
-            self._check_night_resolution()
+            if do_resolve:
+                self._check_night_resolution()
             return pid
 
         return pid
@@ -382,7 +402,7 @@ class MafiaServer:
         pids    = list(self.gs.players.keys())
         random.shuffle(pids)
         n       = len(pids)
-        mafia_n = 1 if n <= 5 else (2 if n <= 8 else 3)
+        mafia_n = 1 if n <= 5 else (2 if n <= 8 else (3 if n <= 14 else 4))
         i = 0
         self.gs.mafia_pids = []
         for _ in range(mafia_n):
@@ -402,109 +422,110 @@ class MafiaServer:
                 return
             alive  = [p for p in self.gs.players.values() if p["alive"]]
             voters = [p["pid"] for p in alive]
-            # Check if all alive players have voted (including skip votes represented as None)
             if any(v not in self.gs.votes for v in voters):
-                return
+                return  # wait for everyone to vote (including /skip)
 
             tally = defaultdict(int)
             for v in voters:
-                target = self.gs.votes[v]
-                if target is not None:
-                    tally[target] += 1
+                tally[self.gs.votes[v]] += 1
+            max_v = max(tally.values())
+            top   = [t for t, c in tally.items() if c == max_v]
+            elim  = random.choice(top)
 
-            if not tally:
-                # Everyone skipped — no elimination
-                self._sys("-" * 52)
-                self._sys("  VOTE RESULT: No votes cast. Nobody is eliminated.")
-                self._sys("  Night " + str(self.gs.day + 1) + " falls.")
-                self._move_to_night()
-                return
+            # If SKIP wins (or ties and is chosen), no elimination
+            skip_vote = (elim == "SKIP")
+            victim    = None
+            if not skip_vote:
+                victim = self.gs.players[elim]
+                victim["alive"] = False
 
-            max_v  = max(tally.values())
-            top    = [p for p, c in tally.items() if c == max_v]
-            elim   = random.choice(top)
-            victim = self.gs.players[elim]
-            victim["alive"]     = False
+            self.gs.phase            = PHASE_NIGHT
+            self.gs.day             += 1
+            self.gs.votes            = {}
+            self.gs.night_acts       = {}
+            self.gs.last_killed      = None
+            self.gs.last_saved       = False
+            self.gs.night_resolving  = False
+            self.gs.night_countdown  = 0
 
         self._sys("-" * 52)
-        self._sys("  VOTE RESULT: " + victim["name"] + " has been eliminated.")
-        self._sys("  Their role: " + victim["role"] + ".")
-        self._sys("  Night " + str(self.gs.day + 1) + " falls. The town goes silent.")
+        if skip_vote:
+            self._sys("  VOTE RESULT: The town chose to skip. No one was eliminated.")
+        else:
+            self._sys("  VOTE RESULT: " + victim["name"] + " has been eliminated.")
+            self._sys("  Their role: " + ("Villager" if victim["role"] in (ROLE_SHERIFF, ROLE_DOCTOR) else victim["role"]) + ".")
+        self._sys("  Night " + str(self.gs.day) + " falls. The town goes silent.")
         self._sys("-" * 52)
-
-        with self.gs.lock:
-            if not self._check_win():
-                self._move_to_night()
-            else:
-                self._broadcast_state()
-
-    def _move_to_night(self):
-        """Transition from day to night, resetting night state."""
-        with self.gs.lock:
-            self.gs.phase = PHASE_NIGHT
-            self.gs.day += 1
-            self.gs.votes = {}
-            self.gs.night_acts = {}
-            self.gs.night_processed = False
-            self.gs.last_killed = None
-            self.gs.last_saved = False
-            # Sheriff results persist; doc protection history persists
-        self._broadcast_state()
+        if not self._check_win():
+            self._broadcast_state()
 
     def _check_night_resolution(self):
+        """Check if all special roles have acted; if so, start the 5-second countdown."""
         with self.gs.lock:
             if self.gs.phase != PHASE_NIGHT:
                 return
-            # Prevent double resolution
-            if self.gs.night_processed:
-                return
+            if getattr(self.gs, "night_resolving", False):
+                return  # countdown already running
 
             alive       = {p["pid"]: p for p in self.gs.players.values() if p["alive"]}
             mafia_alive = [pid for pid in self.gs.mafia_pids if pid in alive]
+
+            # Find alive special roles (only if that role is enabled in settings)
             sheriff_pid = next(
                 (pid for pid, p in alive.items()
-                 if p["role"] == ROLE_SHERIFF and self.gs.settings["sheriff"]),
-                None
+                 if p["role"] == ROLE_SHERIFF and self.gs.settings["sheriff"]), None
             )
             doctor_pid = next(
                 (pid for pid, p in alive.items()
-                 if p["role"] == ROLE_DOCTOR and self.gs.settings["doctor"]),
-                None
+                 if p["role"] == ROLE_DOCTOR and self.gs.settings["doctor"]), None
             )
 
-            # Determine which roles have pending actions
-            # Mafia: all alive mafia must have submitted a kill (or be waiting)
-            mafia_ready = True
-            if mafia_alive:
-                mafia_ready = all(pid in self.gs.night_acts for pid in mafia_alive)
+            # ALL special roles must act before night ends
+            mafia_rdy   = all(pid in self.gs.night_acts for pid in mafia_alive) if mafia_alive else True
+            sheriff_rdy = (sheriff_pid is None or sheriff_pid in self.gs.night_acts)
+            doctor_rdy  = (doctor_pid  is None or doctor_pid  in self.gs.night_acts)
 
-            # Sheriff: if exists and hasn't acted, they're not ready
-            sheriff_ready = True
-            if sheriff_pid:
-                sheriff_ready = sheriff_pid in self.gs.night_acts
+            if not (mafia_rdy and sheriff_rdy and doctor_rdy):
+                return  # still waiting on someone
 
-            # Doctor: if exists and hasn't acted, they're not ready
-            doctor_ready = True
-            if doctor_pid:
-                doctor_ready = doctor_pid in self.gs.night_acts
+            # Mark countdown started so we don't double-trigger
+            self.gs.night_resolving = True
 
-            # If any role with required action hasn't submitted, wait
-            if not (mafia_ready and sheriff_ready and doctor_ready):
+        # ── Broadcast "all actions in" state so mafia can see final kill votes ──
+        self._broadcast_state()
+
+        # ── 5-second countdown then resolve ──
+        def _do_countdown():
+            for i in range(5, 0, -1):
+                with self.gs.lock:
+                    self.gs.night_countdown = i
+                self._broadcast_state()
+                time.sleep(1)
+            with self.gs.lock:
+                self.gs.night_countdown = 0
+            self._resolve_night()
+
+        threading.Thread(target=_do_countdown, daemon=True).start()
+
+    def _resolve_night(self):
+        """Apply night actions and transition to day."""
+        with self.gs.lock:
+            if self.gs.phase != PHASE_NIGHT:
                 return
+            alive       = {p["pid"]: p for p in self.gs.players.values() if p["alive"]}
+            mafia_alive = [pid for pid in self.gs.mafia_pids if pid in alive]
 
-            # All actions are in — process night, but don't mark processed yet
-            # so we can compute everything in one go
-            self.gs.night_processed = True
+            sheriff_pid = next(
+                (pid for pid, p in alive.items()
+                 if p["role"] == ROLE_SHERIFF and self.gs.settings["sheriff"]), None
+            )
+            doctor_pid = next(
+                (pid for pid, p in alive.items()
+                 if p["role"] == ROLE_DOCTOR and self.gs.settings["doctor"]), None
+            )
 
-            # ── Process sheriff investigation (if submitted) ──
-            if sheriff_pid:
-                act = self.gs.night_acts.get(sheriff_pid)
-                if act and act["type"] == "investigate":
-                    t    = act["target"]
-                    is_m = t in self.gs.mafia_pids
-                    self.gs.sheriff_results.setdefault(sheriff_pid, {})[t] = is_m
-
-            # ── Process doctor protection (if submitted) ──
+            # Sheriff investigation already recorded in _process immediately on submit.
+            # Doctor protection
             protected = None
             if doctor_pid:
                 act = self.gs.night_acts.get(doctor_pid)
@@ -512,7 +533,7 @@ class MafiaServer:
                     protected = act["target"]
                     self.gs.doc_last_protected = protected
 
-            # ── Resolve mafia kill ──
+            # Mafia kill tally
             kill_tally = defaultdict(int)
             for pid in mafia_alive:
                 act = self.gs.night_acts.get(pid)
@@ -530,28 +551,27 @@ class MafiaServer:
                 self.gs.players[kill_target]["alive"] = False
                 killed_pid = kill_target
 
-            self.gs.last_killed = killed_pid
-            self.gs.last_saved  = saved
-            self.gs.phase       = PHASE_DAY
-            self.gs.night_acts  = {}
-            self.gs.votes       = {}
+            self.gs.last_killed     = killed_pid
+            self.gs.last_saved      = saved
+            self.gs.phase           = PHASE_DAY
+            self.gs.night_acts      = {}
+            self.gs.votes           = {}
+            self.gs.night_resolving = False
+            self.gs.night_countdown = 0
 
-        # Outside lock for system messages
         self._sys("-" * 52)
         if saved:
             self._sys("  MORNING: The Doctor saved someone -- no one died tonight.")
         elif killed_pid:
             v = self.gs.players[killed_pid]
             self._sys("  MORNING: " + v["name"] + " was found dead. The Mafia struck.")
-            self._sys("  Their role: " + v["role"] + ".")
+            self._sys("  Their role: " + ("Villager" if v["role"] in (ROLE_SHERIFF, ROLE_DOCTOR) else v["role"]) + ".")
         else:
             self._sys("  MORNING: A quiet night -- no one was killed.")
         self._sys("  Day " + str(self.gs.day) + " begins. Discuss and vote.")
         self._sys("-" * 52)
-
-        with self.gs.lock:
-            if not self._check_win():
-                self._broadcast_state()
+        if not self._check_win():
+            self._broadcast_state()
 
     def _check_win(self):
         alive         = [p for p in self.gs.players.values() if p["alive"]]
@@ -654,10 +674,12 @@ class MafiaClient:
         self.buf        = ""
         self.conn       = None
         self.running    = True
-        self.input_str  = ""
-        self.msg_offset = 0
-        self.error_msg  = ""
-        self.error_ts   = 0
+        self.input_str      = ""
+        self.msg_offset     = 0
+        self.error_msg      = ""
+        self.error_ts       = 0
+        self.seen_sheriff   = set()   # pids already notified about
+        self.local_msgs     = []      # injected client-side messages (sheriff reveals)
 
     def connect(self):
         self.conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -683,12 +705,36 @@ class MafiaClient:
                         continue
                     if obj.get("type") == "state":
                         self.state = obj
+                        self._check_sheriff_notifications()
                     elif obj.get("type") == "error":
                         self.error_msg = obj.get("text", "Error")
                         self.error_ts  = time.time()
             except Exception:
                 break
         self.running = False
+
+    def _check_sheriff_notifications(self):
+        """Inject a local message when the sheriff gets a new investigation result."""
+        s = self.state
+        players = s.get("players", {})
+        me = players.get(self.pid, {})
+        if me.get("role") != ROLE_SHERIFF:
+            return
+        sheriff_log = s.get("sheriff_log", {})
+        for inv_pid, is_mafia in sheriff_log.items():
+            if inv_pid not in self.seen_sheriff:
+                self.seen_sheriff.add(inv_pid)
+                inv_name = players.get(inv_pid, {}).get("name", "?")
+                if is_mafia:
+                    text = "  INVESTIGATION: " + inv_name + " is Mafia!"
+                else:
+                    text = "  INVESTIGATION: " + inv_name + " is Clean!"
+                self.local_msgs.append({
+                    "text": text, "author": "SYSTEM", "author_pid": None,
+                    "author_role": None, "channel": CH_SYS,
+                    "ts": time.time(), "local": True,
+                    "inv_pid": inv_pid, "is_mafia": is_mafia,
+                })
 
     def _send(self, obj):
         try:
@@ -723,15 +769,26 @@ class MafiaClient:
         curses.init_pair(C_WHITE,  curses.COLOR_WHITE,  -1)
         curses.init_pair(C_GREEN,  curses.COLOR_GREEN,  -1)
         curses.init_pair(C_RED,    curses.COLOR_RED,    -1)
-        # Use YELLOW but we'll pair with A_BOLD for #F1C40F style gold
         curses.init_pair(C_YELLOW, curses.COLOR_YELLOW, -1)
-        curses.init_pair(C_BLUE,   curses.COLOR_CYAN,   -1)
+        curses.init_pair(C_BLUE, curses.COLOR_CYAN, -1)   # doctor cyan — same for all viewers
         curses.init_pair(C_GREY,   8,                   -1)
-        # Gold color: yellow + bold gives a richer gold (#F1C40F style)
         curses.init_pair(C_GOLD,   curses.COLOR_YELLOW, -1)
         curses.init_pair(C_HEADER, curses.COLOR_BLACK,  curses.COLOR_WHITE)
         curses.init_pair(C_INPUT,  curses.COLOR_WHITE,  -1)
         curses.init_pair(C_DIM,    8,                   -1)
+        # Sheriff gold: try to use a true #F1C40F-like gold via init_color (colour 11)
+        # Falls back gracefully on terminals that don't support colour editing
+        # Sheriff gold colour. Uses colour slot 200 (NOT 11 — that's a pair id)
+        # to avoid any collision with default palette or pair IDs.
+        try:
+            if curses.can_change_color() and curses.COLORS >= 256:
+                curses.init_color(200, 945, 769, 59)   # #F1C40F
+                curses.init_pair(C_SHERIFF_GOLD, 200, -1)
+            else:
+                # Fallback: bold yellow looks gold-ish on most terminals
+                curses.init_pair(C_SHERIFF_GOLD, curses.COLOR_YELLOW, -1)
+        except Exception:
+            curses.init_pair(C_SHERIFF_GOLD, curses.COLOR_YELLOW, -1)
 
     # ══════════════════════════════════════════════════════════════════════
     # MAIN DRAW
@@ -784,7 +841,7 @@ class MafiaClient:
     # ── Player list (left panel) ───────────────────────────────────────────
     def _draw_players(self, stdscr, H, W, PWIDTH, players, s, my_role, is_alive):
         row = 2
-        self._put(stdscr, row, 1, "PLAYERS", curses.color_pair(C_GOLD) | curses.A_BOLD)
+        self._put(stdscr, row, 1, "PLAYERS", curses.color_pair(C_WHITE) | curses.A_BOLD)
         row += 1
         self._put(stdscr, row, 1, "-" * (PWIDTH - 2), curses.color_pair(C_DIM))
         row += 1
@@ -801,16 +858,10 @@ class MafiaClient:
             name  = p["name"][: PWIDTH - 4]
 
             if not alive:
-                if is_alive:
-                    # Alive viewer: dead players shown grey
-                    name_attr = curses.color_pair(C_GREY) | curses.A_DIM
-                else:
-                    # Dead viewer: see true role colours for everyone
-                    col, extra = self._role_colour_by_true_role(p.get("role"))
-                    name_attr  = curses.color_pair(col) | extra | curses.A_DIM
+                name_attr = curses.color_pair(C_GREY) | curses.A_DIM
             else:
                 col, extra = self._player_colour(pid, p, my_role, mafia_pids, sheriff_log, is_me)
-                name_attr  = curses.color_pair(col) | extra | (curses.A_BOLD if is_me else 0)
+                name_attr  = curses.color_pair(col) | extra
 
             marker = ">" if is_me else " "
             suffix = " X" if not alive else (" <" if is_me else "")
@@ -821,73 +872,144 @@ class MafiaClient:
             role_tag = self._role_tag(pid, p, my_role, mafia_pids, sheriff_log, is_me, is_alive)
             if role_tag and row < H - 6:
                 if not is_alive:
-                    # Dead viewer: colour the role tag by true role
+                    # Dead viewer always sees role tags in role colour (name is grey above)
                     tag_col, tag_extra = self._role_colour_by_true_role(p.get("role"))
-                    tag_attr = curses.color_pair(tag_col) | tag_extra | curses.A_DIM
+                    tag_attr = curses.color_pair(tag_col) | tag_extra
+                elif not alive:
+                    # Alive viewer: dead player's role tag still dim (role is hidden)
+                    tag_attr = curses.color_pair(C_DIM)
                 else:
                     tag_attr = curses.color_pair(C_DIM)
                 self._put(stdscr, row, 3, role_tag[: PWIDTH - 4], tag_attr)
                 row += 1
 
-        # Vote tally (day only)
+        # Vote tally (day only) — show target counts, skips, and who voted
         if phase == PHASE_DAY:
             votes = s.get("votes", {})
-            tally = defaultdict(int)
-            for v in votes.values():
-                if v is not None:
-                    tally[v] += 1
-            if tally and row < H - 6:
-                row += 1
-                self._put(stdscr, row, 1, "VOTES", curses.color_pair(C_GOLD) | curses.A_BOLD)
-                row += 1
-                for tpid, cnt in sorted(tally.items(), key=lambda x: -x[1]):
-                    if row >= H - 6:
-                        break
-                    tname = players.get(tpid, {}).get("name", "?")[: PWIDTH - 5]
-                    self._put(stdscr, row, 1, tname + ": " + str(cnt),
-                              curses.color_pair(C_WHITE))
-                    row += 1
+            alive_players = {pid: p for pid, p in players.items() if p.get("alive")}
 
-        # Night action status + kill vote tally for mafia
-        if phase == PHASE_NIGHT and is_alive and my_role in (ROLE_MAFIA, ROLE_SHERIFF, ROLE_DOCTOR):
-            night_acts = s.get("night_acts", {})
-            my_act     = night_acts.get(self.pid)
             if row < H - 6:
                 row += 1
-                status = "Action set" if my_act else "Pending..."
-                col    = C_GREEN if my_act else C_GOLD
-                self._put(stdscr, row, 1, status[: PWIDTH - 2], curses.color_pair(col))
+                voted_count   = len(votes)
+                total_alive   = len(alive_players)
+                header = "VOTES (" + str(voted_count) + "/" + str(total_alive) + ")"
+                self._put(stdscr, row, 1, header[: PWIDTH - 2],
+                          curses.color_pair(C_WHITE) | curses.A_BOLD)
                 row += 1
 
-            # Mafia: show kill vote tally like daytime votes
-            if my_role == ROLE_MAFIA and night_acts and row < H - 6:
-                self._put(stdscr, row, 1, "KILL VOTES", curses.color_pair(C_RED) | curses.A_BOLD)
-                row += 1
-                kill_tally = defaultdict(int)
-                for act in night_acts.values():
-                    if act.get("type") == "kill":
-                        kill_tally[act["target"]] += 1
-                for tpid, cnt in sorted(kill_tally.items(), key=lambda x: -x[1]):
-                    if row >= H - 6:
-                        break
+            # Target tally
+            tally = defaultdict(int)
+            for v in votes.values():
+                tally[v] += 1
+
+            for tpid, cnt in sorted(tally.items(), key=lambda x: -x[1]):
+                if row >= H - 6:
+                    break
+                if tpid == "SKIP":
+                    label = "Skip: " + str(cnt)
+                    self._put(stdscr, row, 1, label[: PWIDTH - 2],
+                              curses.color_pair(C_DIM))
+                else:
                     tname = players.get(tpid, {}).get("name", "?")[: PWIDTH - 5]
                     self._put(stdscr, row, 1, tname + ": " + str(cnt),
                               curses.color_pair(C_WHITE))
+                row += 1
+
+            # Show each alive player's vote status
+            if row < H - 6:
+                row += 1
+                self._put(stdscr, row, 1, "WHO VOTED", curses.color_pair(C_WHITE) | curses.A_BOLD)
+                row += 1
+            for vpid, p in sorted(alive_players.items(), key=lambda x: x[1]["name"]):
+                if row >= H - 6:
+                    break
+                vname = p["name"][: PWIDTH - 6]
+                if vpid in votes:
+                    target = votes[vpid]
+                    if target == "SKIP":
+                        mark = " skip"
+                    else:
+                        tgt_name = players.get(target, {}).get("name", "?")[:6]
+                        mark = "->" + tgt_name
+                    self._put(stdscr, row, 1, (vname + " " + mark)[: PWIDTH - 2],
+                              curses.color_pair(C_GREEN))
+                else:
+                    self._put(stdscr, row, 1, (vname + " ...")[: PWIDTH - 2],
+                              curses.color_pair(C_DIM))
+                row += 1
+
+        # Night action status + kill vote tally for mafia
+        if phase == PHASE_NIGHT:
+            night_acts      = s.get("night_acts", {})
+            countdown       = s.get("night_countdown", 0)
+            night_resolving = s.get("night_resolving", False)
+
+            # Countdown display (visible to everyone at night)
+            if night_resolving and countdown > 0 and row < H - 6:
+                row += 1
+                self._put(stdscr, row, 1, ("Dawn in " + str(countdown) + "...")[: PWIDTH - 2],
+                          curses.color_pair(C_GOLD) | curses.A_BOLD)
+                row += 1
+
+            if is_alive and my_role in (ROLE_MAFIA, ROLE_SHERIFF, ROLE_DOCTOR):
+                my_act = night_acts.get(self.pid)
+                if row < H - 6:
+                    if not night_resolving:
+                        status = "Action set" if my_act else "Pending..."
+                        scol   = C_GREEN if my_act else C_GOLD
+                        self._put(stdscr, row, 1, status[: PWIDTH - 2], curses.color_pair(scol))
+                        row += 1
+
+                # Sheriff: show investigation log in side panel immediately
+                if my_role == ROLE_SHERIFF and row < H - 6:
+                    sheriff_log = s.get("sheriff_log", {})
+                    if sheriff_log:
+                        if row < H - 6:
+                            self._put(stdscr, row, 1, "FINDINGS",
+                                      curses.color_pair(C_WHITE) | curses.A_BOLD)
+                            row += 1
+                        for inv_pid, is_m in sheriff_log.items():
+                            if row >= H - 6:
+                                break
+                            inv_name = players.get(inv_pid, {}).get("name", "?")[:PWIDTH - 8]
+                            result_col = C_RED if is_m else C_GREEN
+                            result_lbl = "MAFIA" if is_m else "clean"
+                            label = inv_name + ": " + result_lbl
+                            self._put(stdscr, row, 1, label[: PWIDTH - 2],
+                                      curses.color_pair(result_col))
+                            row += 1
+
+                # Mafia: show kill vote tally
+                if my_role == ROLE_MAFIA and night_acts and row < H - 6:
+                    self._put(stdscr, row, 1, "KILL VOTES",
+                              curses.color_pair(C_RED) | curses.A_BOLD)
                     row += 1
+                    kill_tally = defaultdict(int)
+                    for act in night_acts.values():
+                        if act.get("type") == "kill":
+                            kill_tally[act["target"]] += 1
+                    for tpid, cnt in sorted(kill_tally.items(), key=lambda x: -x[1]):
+                        if row >= H - 6:
+                            break
+                        tname = players.get(tpid, {}).get("name", "?")[: PWIDTH - 5]
+                        self._put(stdscr, row, 1, tname + ": " + str(cnt),
+                                  curses.color_pair(C_WHITE))
+                        row += 1
 
     def _player_colour(self, pid, p, my_role, mafia_pids, sheriff_log, is_me):
         """
         Returns (colour_pair_id, extra_attr) per role POV:
           Mafia   — self + allies = RED,        others = GREEN
-          Sheriff — self = GOLD (YELLOW + BOLD), confirmed mafia = RED, others = GREEN
+          Sheriff — self = YELLOW+BOLD (gold),  confirmed mafia = RED, others = GREEN
           Doctor  — self = BLUE(cyan),          others = GREEN
           Villager— everyone GREEN
         """
         if my_role == ROLE_MAFIA:
-            return (C_RED if pid in mafia_pids else C_GREEN, 0)
+            # All mafia (self + allies) same dark red; others green
+            return (C_RED, 0) if pid in mafia_pids else (C_GREEN, 0)
         if my_role == ROLE_SHERIFF:
             if is_me:
-                return (C_GOLD, curses.A_BOLD)   # Gold style for sheriff
+                return (C_SHERIFF_GOLD, curses.A_BOLD)  # gold
             if pid in sheriff_log and sheriff_log[pid]:
                 return (C_RED, 0)
             return (C_GREEN, 0)
@@ -900,7 +1022,7 @@ class MafiaClient:
         if role == ROLE_MAFIA:
             return (C_RED, 0)
         if role == ROLE_SHERIFF:
-            return (C_GOLD, curses.A_BOLD)  # Gold style for sheriff
+            return (C_SHERIFF_GOLD, curses.A_BOLD)
         if role == ROLE_DOCTOR:
             return (C_BLUE, 0)
         return (C_GREEN, 0)   # Villager / Unknown
@@ -914,7 +1036,7 @@ class MafiaClient:
         if my_role == ROLE_MAFIA and pid in mafia_pids:
             return "[Mafia]"
         if my_role == ROLE_SHERIFF and pid in sheriff_log:
-            return "[Mafia!]" if sheriff_log[pid] else "[Clean]"
+            return "[Mafia]" if sheriff_log[pid] else "[Clean]"
         return ""
 
     # ── Divider ────────────────────────────────────────────────────────────
@@ -927,11 +1049,15 @@ class MafiaClient:
 
     # ── Single chat area ───────────────────────────────────────────────────
     def _draw_chat(self, stdscr, H, W, PWIDTH, CWIDTH, s, my_role, phase, is_alive):
-        messages = s.get("messages", [])
-        players  = s.get("players", {})
+        # Merge server messages with any local-only messages (e.g. sheriff notifications)
+        # Sort by timestamp so they appear in chronological order
+        server_msgs = s.get("messages", [])
+        all_msgs    = sorted(server_msgs + self.local_msgs, key=lambda m: m.get("ts", 0))
+        messages    = all_msgs
+        players     = s.get("players", {})
         mafia_pids  = s.get("mafia_pids", [])
         sheriff_log = s.get("sheriff_log", {})
-        col0     = PWIDTH + 1
+        col0        = PWIDTH + 1
 
         # Build wrapped lines. Each entry stores:
         #   line        — full text of this wrapped line
@@ -998,18 +1124,20 @@ class MafiaClient:
             body_attr  = self._body_attr(entry)
 
             if ch == CH_GHOST:
-                # Entire ghost line — italic + grey dim
                 ghost_attr = curses.color_pair(C_GREY) | curses.A_DIM
                 try:
                     ghost_attr |= curses.A_ITALIC
                 except AttributeError:
-                    pass  # older curses builds may not have A_ITALIC
+                    pass
                 self._put(stdscr, r, col0, line, ghost_attr)
-            elif ch == CH_SYS or prefix_len == 0:
-                # System messages or continuation lines — no prefix colouring
+            elif ch == CH_SYS:
+                # Rich rendering: bold keywords, coloured roles, white numbers
+                self._render_sys_line(stdscr, r, col0, line, CWIDTH, players)
+            elif prefix_len == 0:
+                # Continuation wrap line — body colour only
                 self._put(stdscr, r, col0, line, body_attr)
             else:
-                # Render name prefix in its colour, body in white
+                # Name prefix in role colour, body in white
                 name_part = line[:prefix_len]
                 body_part = line[prefix_len:]
                 self._put(stdscr, r, col0,              name_part, name_attr)
@@ -1034,16 +1162,12 @@ class MafiaClient:
         if not viewer_alive:
             # Dead viewer sees true role colours
             col, extra = self._role_colour_by_true_role(p.get("role"))
-            attr = curses.color_pair(col) | extra
-            if is_me:
-                attr |= curses.A_BOLD
-            return attr
+            return curses.color_pair(col) | extra
 
+        # No A_BOLD for is_me — bold on RED/BLUE renders as light variants on
+        # most terminals which breaks the uniform colour scheme
         col, extra = self._player_colour(apid, p, my_role, mafia_pids, sheriff_log, is_me)
-        attr = curses.color_pair(col) | extra
-        if is_me:
-            attr |= curses.A_BOLD
-        return attr
+        return curses.color_pair(col) | extra
 
     def _body_attr(self, entry):
         """Curses attr for the message body (after the name prefix)."""
@@ -1060,6 +1184,122 @@ class MafiaClient:
             return curses.color_pair(C_WHITE) | curses.A_BOLD
         return curses.color_pair(C_WHITE)
 
+    # ── Rich system message renderer ──────────────────────────────────────
+    def _render_sys_line(self, stdscr, row, col, line, CWIDTH, players=None):
+        """
+        Render a system message line with inline colour segments:
+          - BOLD KEYWORDS (MORNING, VOTE RESULT, etc.)  → bold white
+          - Role words (Villager, Mafia, Sheriff, Doctor) → role colour
+          - Day/Night numbers                            → bold white
+          - Separator lines (all dashes/equals)         → dim grey
+          - Everything else                             → dim grey
+        """
+        # Pure separator lines
+        stripped = line.strip()
+        if all(c in '-= ' for c in stripped) and stripped:
+            self._put(stdscr, row, col, line[:CWIDTH-1], curses.color_pair(C_DIM))
+            return
+
+        # Build a list of (text, attr) segments by scanning the line
+        # We tokenise by known special words
+        ROLE_COLOURS = {
+            ROLE_VILLAGER: (C_GREEN,  0),
+            ROLE_MAFIA:    (C_RED,    0),
+            ROLE_SHERIFF:  (C_SHERIFF_GOLD, curses.A_BOLD),
+            ROLE_DOCTOR:   (C_BLUE, 0),
+            "Clean":       (C_GREEN,  0),
+            "Innocent":    (C_GREEN,  0),
+        }
+        BOLD_KEYWORDS = {
+            "MORNING:", "VOTE RESULT:", "VILLAGE WINS!", "MAFIA WINS!",
+            "Final Role Reveal", "MORNING", "VOTE RESULT",
+            "INVESTIGATION:", "INVESTIGATION",
+        }
+
+        # Collect known player names for white highlighting
+        player_names = sorted(
+            [p["name"] for p in (players or {}).values()],
+            key=len, reverse=True  # longest first to avoid partial matches
+        )
+
+        base_attr    = curses.color_pair(C_GOLD)                        # brownish yellow body text
+        keyword_attr = curses.color_pair(C_RED)  | curses.A_BOLD          # MORNING:, VOTE RESULT: etc
+        number_attr  = curses.color_pair(C_WHITE) | curses.A_BOLD          # day/night numbers
+
+        # Split line into tokens keeping spaces, then reassemble with attrs
+        # Simple approach: scan character by character matching known words
+        segments = []
+        i = 0
+        while i < len(line):
+            # Check for bold keywords at this position
+            matched_kw = None
+            for kw in sorted(BOLD_KEYWORDS, key=len, reverse=True):
+                if line[i:i+len(kw)] == kw:
+                    matched_kw = kw
+                    break
+            if matched_kw:
+                segments.append((matched_kw, keyword_attr))
+                i += len(matched_kw)
+                continue
+
+            # Check for player names (render white)
+            matched_name = None
+            for pname in player_names:
+                if line[i:i+len(pname)] == pname:
+                    before = line[i-1] if i > 0 else " "
+                    after  = line[i+len(pname)] if i+len(pname) < len(line) else " "
+                    if not before.isalpha() and not after.isalpha():
+                        matched_name = pname
+                        break
+            if matched_name:
+                segments.append((matched_name, curses.color_pair(C_WHITE) | curses.A_BOLD))
+                i += len(matched_name)
+                continue
+
+            # Check for role names
+            matched_role = None
+            for role, (cpair, extra) in ROLE_COLOURS.items():
+                if line[i:i+len(role)] == role:
+                    # Make sure it's not mid-word (preceded/followed by non-alpha)
+                    before = line[i-1] if i > 0 else " "
+                    after  = line[i+len(role)] if i+len(role) < len(line) else " "
+                    if not before.isalpha() and not after.isalpha():
+                        matched_role = (role, cpair, extra)
+                        break
+            if matched_role:
+                role_text, cpair, extra = matched_role
+                segments.append((role_text, curses.color_pair(cpair) | extra))
+                i += len(role_text)
+                continue
+
+            # Check for standalone numbers (day numbers etc.)
+            if line[i].isdigit():
+                j = i
+                while j < len(line) and line[j].isdigit():
+                    j += 1
+                before = line[i-1] if i > 0 else " "
+                after  = line[j] if j < len(line) else " "
+                if not before.isalpha() and not after.isalpha():
+                    segments.append((line[i:j], number_attr))
+                    i = j
+                    continue
+
+            # Regular character — accumulate into base
+            if segments and segments[-1][1] == base_attr:
+                segments[-1] = (segments[-1][0] + line[i], base_attr)
+            else:
+                segments.append((line[i], base_attr))
+            i += 1
+
+        # Render segments
+        x = col
+        for text, attr in segments:
+            if x >= col + CWIDTH - 1:
+                break
+            avail = col + CWIDTH - 1 - x
+            self._put(stdscr, row, x, text[:avail], attr)
+            x += len(text)
+
     # ── Input bar ──────────────────────────────────────────────────────────
     def _draw_input(self, stdscr, H, W, PWIDTH, CWIDTH, phase, is_alive, my_role, is_host, s):
         col0 = PWIDTH + 1
@@ -1074,14 +1314,27 @@ class MafiaClient:
                       curses.color_pair(C_RED))
 
         # Channel indicator + input
-        can_chat  = self._can_chat(phase, is_alive, my_role)
+        can_type  = self._can_chat(phase, is_alive, my_role)
         chan_tag  = ""
         if not is_alive:
             chan_tag = "[GHOST] "
         elif my_role == ROLE_MAFIA and phase == PHASE_NIGHT:
             chan_tag = "[MAFIA] "
+        elif my_role in (ROLE_SHERIFF, ROLE_DOCTOR) and phase == PHASE_NIGHT:
+            night_acts = s.get("night_acts", {})
+            if self.pid in night_acts:
+                # Action done — show waiting message instead of input
+                self._put(stdscr, H - 3, col0,
+                          "[ Action submitted. Waiting for morning... ]",
+                          curses.color_pair(C_DIM))
+                hints = self._hints(phase, is_alive, my_role, is_host)
+                self._put(stdscr, H - 2, col0, hints[: CWIDTH - 1], curses.color_pair(C_DIM))
+                hints2 = self._hints2(phase, is_alive, my_role, is_host)
+                self._put(stdscr, H - 1, col0, hints2[: CWIDTH - 1], curses.color_pair(C_DIM))
+                return
+            chan_tag = "[SHERIFF] " if my_role == ROLE_SHERIFF else "[DOCTOR]  "
 
-        if can_chat:
+        if can_type:
             prompt = chan_tag + "> " + self.input_str
             self._put(stdscr, H - 3, col0, prompt[: CWIDTH - 1],
                       curses.color_pair(C_INPUT) | curses.A_BOLD)
@@ -1099,10 +1352,12 @@ class MafiaClient:
         self._put(stdscr, H - 1, col0, hints2[: CWIDTH - 1], curses.color_pair(C_DIM))
 
     def _can_chat(self, phase, is_alive, my_role):
+        """Whether the player can type in the input box right now."""
         if not is_alive:
             return True   # dead can always ghost-chat
         if phase == PHASE_NIGHT:
-            return my_role == ROLE_MAFIA   # only mafia talk at night
+            # Mafia chat; sheriff/doctor can type commands even though they can't chat
+            return my_role in (ROLE_MAFIA, ROLE_SHERIFF, ROLE_DOCTOR)
         return phase in (PHASE_DAY, PHASE_LOBBY)
 
     def _hints(self, phase, is_alive, my_role, is_host):
@@ -1111,14 +1366,20 @@ class MafiaClient:
         if phase == PHASE_LOBBY:
             return "Waiting for players...  Chat freely."
         if phase == PHASE_DAY:
-            return "Discuss with the town. Vote to eliminate a suspect."
+            return "Discuss with the town. Vote to eliminate a suspect. Use /skip to abstain."
         if phase == PHASE_NIGHT:
             if my_role == ROLE_MAFIA:
-                return "Night. Coordinate with your crew."
+                return "Night. Coordinate with your crew. Use /kill NAME to vote who to eliminate."
             if my_role == ROLE_SHERIFF:
+                night_acts = self.state.get("night_acts", {})
+                if self.pid in night_acts:
+                    return "Night. Investigation submitted. Waiting for morning..."
                 return "Night. Use /investigate NAME to check a player."
             if my_role == ROLE_DOCTOR:
-                return "Night. Use /protect NAME to protect a player."
+                night_acts = self.state.get("night_acts", {})
+                if self.pid in night_acts:
+                    return "Night. Protection submitted. Waiting for morning..."
+                return "Night. Use /protect NAME to protect someone (not same person twice)."
             return "Night. The town sleeps. Wait for morning..."
         return ""
 
@@ -1127,7 +1388,7 @@ class MafiaClient:
         if phase == PHASE_LOBBY and is_host:
             parts += ["/start", "/sheriff on|off", "/doctor on|off"]
         if phase == PHASE_DAY and is_alive:
-            parts += ["/vote NAME", "/unvote", "/skip"]
+            parts += ["/vote NAME", "/skip", "/unvote"]
         if phase == PHASE_NIGHT and is_alive:
             if my_role == ROLE_MAFIA:
                 parts.append("/kill NAME")
@@ -1143,11 +1404,11 @@ class MafiaClient:
         """PWIDTH is passed explicitly to avoid NameError."""
         settings = s.get("settings", {})
         n        = len(s.get("players", {}))
-        mafia_n  = 1 if n <= 5 else (2 if n <= 8 else 3)
+        mafia_n  = 1 if n <= 5 else (2 if n <= 8 else (3 if n <= 14 else 4))
         col0     = PWIDTH + 2
 
         lines = [
-            "Players: " + str(n) + "/12  |  "
+            "Players: " + str(n) + "/20  |  "
             + "Sheriff: " + ("ON" if settings.get("sheriff") else "OFF") + "  |  "
             + "Doctor: "  + ("ON" if settings.get("doctor")  else "OFF"),
             "Mafia count: " + str(mafia_n) + "  |  Min 4 players to start.",
@@ -1224,9 +1485,6 @@ class MafiaClient:
                 return
 
             if cmd == "/vote" and phase == PHASE_DAY and is_alive:
-                if len(parts) < 2:
-                    self._err("Usage: /vote <name>")
-                    return
                 tpid = self._find_player(" ".join(parts[1:]), players, alive_only=True)
                 if tpid:
                     self._send({"type": "vote", "target": tpid})
@@ -1234,29 +1492,23 @@ class MafiaClient:
                     self._err("Player not found: " + " ".join(parts[1:]))
                 return
 
-            if cmd == "/skip" and phase == PHASE_DAY and is_alive:
-                self._send({"type": "vote", "target": None})
-                return
-
             if cmd == "/unvote" and phase == PHASE_DAY:
                 self._send({"type": "vote", "target": None}); return
 
+            if cmd == "/skip" and phase == PHASE_DAY and is_alive:
+                self._send({"type": "vote", "target": "SKIP"}); return
+
             if cmd == "/kill" and phase == PHASE_NIGHT and my_role == ROLE_MAFIA and is_alive:
-                if len(parts) < 2:
-                    self._err("Usage: /kill <name>")
-                    return
+                mafia_pids = s.get("mafia_pids", [])
                 tpid = self._find_player(" ".join(parts[1:]), players,
-                                         alive_only=True, exclude=self.pid)
+                                         alive_only=True, exclude_pids=mafia_pids)
                 if tpid:
                     self._send({"type": "night_action", "action": "kill", "target": tpid})
                 else:
-                    self._err("Player not found: " + " ".join(parts[1:]))
+                    self._err("Player not found (can't target teammates): " + " ".join(parts[1:]))
                 return
 
             if cmd == "/investigate" and phase == PHASE_NIGHT and my_role == ROLE_SHERIFF and is_alive:
-                if len(parts) < 2:
-                    self._err("Usage: /investigate <name>")
-                    return
                 tpid = self._find_player(" ".join(parts[1:]), players,
                                          alive_only=True, exclude=self.pid)
                 if tpid:
@@ -1266,9 +1518,6 @@ class MafiaClient:
                 return
 
             if cmd == "/protect" and phase == PHASE_NIGHT and my_role == ROLE_DOCTOR and is_alive:
-                if len(parts) < 2:
-                    self._err("Usage: /protect <name>")
-                    return
                 tpid = self._find_player(" ".join(parts[1:]), players, alive_only=True)
                 if tpid:
                     self._send({"type": "night_action", "action": "protect", "target": tpid})
@@ -1279,28 +1528,31 @@ class MafiaClient:
             self._err("Unknown command: " + cmd); return
 
         # ── Regular chat ──────────────────────────────────────────────────
-        if not self._can_chat(phase, is_alive, my_role):
+        if not is_alive:
+            self._send({"type": "chat", "channel": CH_GHOST, "text": text})
             return
 
-        if not is_alive:
-            channel = CH_GHOST
-        elif my_role == ROLE_MAFIA and phase == PHASE_NIGHT:
-            channel = CH_MAFIA
-        else:
-            channel = CH_TOWN
+        if phase == PHASE_NIGHT:
+            if my_role == ROLE_MAFIA:
+                self._send({"type": "chat", "channel": CH_MAFIA, "text": text})
+            # Sheriff and doctor cannot free-chat at night (commands only)
+            return
 
-        self._send({"type": "chat", "channel": channel, "text": text})
+        if phase in (PHASE_DAY, PHASE_LOBBY):
+            self._send({"type": "chat", "channel": CH_TOWN, "text": text})
 
     def _err(self, msg):
         self.error_msg = msg
         self.error_ts  = time.time()
 
-    def _find_player(self, query, players, alive_only=False, exclude=None):
+    def _find_player(self, query, players, alive_only=False, exclude=None, exclude_pids=None):
         q = query.strip().lower()
         if not q:
             return None
         for pid, p in players.items():
             if exclude and pid == exclude:
+                continue
+            if exclude_pids and pid in exclude_pids:
                 continue
             if alive_only and not p.get("alive", True):
                 continue
@@ -1378,27 +1630,44 @@ INTERNET PLAY (free, no signup)
         threading.Thread(target=server.start, daemon=True).start()
         time.sleep(0.4)
 
-        client = MafiaClient("127.0.0.1", args.port, name)
-        try:
-            client.connect()
-        except Exception as e:
-            print("Could not connect to local server: " + str(e))
-            sys.exit(1)
-        time.sleep(0.2)
-        client.run()
+        while True:
+            client = MafiaClient("127.0.0.1", args.port, name)
+            try:
+                client.connect()
+            except Exception as e:
+                print("Could not connect to local server: " + str(e))
+                sys.exit(1)
+            time.sleep(0.3)
+            # Check if the server rejected us (name taken)
+            if client.error_msg and "already taken" in client.error_msg:
+                print("Name '" + name + "' is already taken.")
+                name = input("Enter a different name: ").strip()[:20]
+                if not name:
+                    sys.exit(1)
+                continue
+            client.run()
+            break
         server.running = False
 
     else:
-        print("Connecting to " + args.server + ":" + str(args.port) + " as '" + name + "'...")
-        client = MafiaClient(args.server, args.port, name)
-        try:
-            client.connect()
-        except Exception as e:
-            print("Connection failed: " + str(e))
-            print("Check the IP/port and make sure the host is running.")
-            sys.exit(1)
-        time.sleep(0.2)
-        client.run()
+        while True:
+            print("Connecting to " + args.server + ":" + str(args.port) + " as '" + name + "'...")
+            client = MafiaClient(args.server, args.port, name)
+            try:
+                client.connect()
+            except Exception as e:
+                print("Connection failed: " + str(e))
+                print("Check the IP/port and make sure the host is running.")
+                sys.exit(1)
+            time.sleep(0.3)
+            if client.error_msg and "already taken" in client.error_msg:
+                print("Name '" + name + "' is already taken.")
+                name = input("Enter a different name: ").strip()[:20]
+                if not name:
+                    sys.exit(1)
+                continue
+            client.run()
+            break
 
 
 if __name__ == "__main__":
