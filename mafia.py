@@ -453,7 +453,7 @@ class MafiaServer:
             self._sys("  VOTE RESULT: The town chose to skip. No one was eliminated.")
         else:
             self._sys("  VOTE RESULT: " + victim["name"] + " has been eliminated.")
-            self._sys("  Their role: " + ("Villager" if victim["role"] in (ROLE_SHERIFF, ROLE_DOCTOR) else victim["role"]) + ".")
+            self._sys("  Their role: " + ("Town" if victim["role"] in (ROLE_VILLAGER, ROLE_SHERIFF, ROLE_DOCTOR) else victim["role"]) + ".")
         self._sys("  Night " + str(self.gs.day) + " falls. The town goes silent.")
         self._sys("-" * 52)
         if not self._check_win():
@@ -565,7 +565,7 @@ class MafiaServer:
         elif killed_pid:
             v = self.gs.players[killed_pid]
             self._sys("  MORNING: " + v["name"] + " was found dead. The Mafia struck.")
-            self._sys("  Their role: " + ("Villager" if v["role"] in (ROLE_SHERIFF, ROLE_DOCTOR) else v["role"]) + ".")
+            self._sys("  Their role: " + ("Town" if v["role"] in (ROLE_VILLAGER, ROLE_SHERIFF, ROLE_DOCTOR) else v["role"]) + ".")
         else:
             self._sys("  MORNING: A quiet night -- no one was killed.")
         self._sys("  Day " + str(self.gs.day) + " begins. Discuss and vote.")
@@ -1209,6 +1209,7 @@ class MafiaClient:
             ROLE_DOCTOR:   (C_BLUE, 0),
             "Clean":       (C_GREEN,  0),
             "Innocent":    (C_GREEN,  0),
+            "Town":        (C_GREEN,  0),
         }
         BOLD_KEYWORDS = {
             "MORNING:", "VOTE RESULT:", "VILLAGE WINS!", "MAFIA WINS!",
