@@ -855,33 +855,55 @@ class MafiaClient:
                 break
             is_me = pid == self.pid
             alive = p.get("alive", True)
-            name  = p["name"][: PWIDTH - 4]
 
+            # ── Determine name colour ──────────────────────────────────────
             if not alive:
+                # Dead players: always grey regardless of who's viewing
                 name_attr = curses.color_pair(C_GREY) | curses.A_DIM
+            elif not is_alive:
+                # Dead viewer looking at an alive player: use true role colour
+                tag_col, tag_extra = self._role_colour_by_true_role(p.get("role"))
+                name_attr = curses.color_pair(tag_col) | tag_extra
             else:
+                # Alive viewer: use role-based colour (limited by what they can see)
                 col, extra = self._player_colour(pid, p, my_role, mafia_pids, sheriff_log, is_me)
                 name_attr  = curses.color_pair(col) | extra
 
-            marker = ">" if is_me else " "
-            suffix = " X" if not alive else (" <" if is_me else "")
-            self._put(stdscr, row, 0, (" " + marker + name + suffix)[: PWIDTH], name_attr)
-            row += 1
-
-            # Role tag on a second line (indented)
+            # ── Determine inline role tag and its colour ───────────────────
             role_tag = self._role_tag(pid, p, my_role, mafia_pids, sheriff_log, is_me, is_alive)
-            if role_tag and row < H - 6:
+            if role_tag:
                 if not is_alive:
-                    # Dead viewer always sees role tags in role colour (name is grey above)
+                    # Dead viewer: tag in role colour
                     tag_col, tag_extra = self._role_colour_by_true_role(p.get("role"))
                     tag_attr = curses.color_pair(tag_col) | tag_extra
+                    if not alive:
+                        tag_attr |= curses.A_DIM
                 elif not alive:
-                    # Alive viewer: dead player's role tag still dim (role is hidden)
                     tag_attr = curses.color_pair(C_DIM)
                 else:
                     tag_attr = curses.color_pair(C_DIM)
-                self._put(stdscr, row, 3, role_tag[: PWIDTH - 4], tag_attr)
-                row += 1
+            else:
+                tag_attr = curses.color_pair(C_DIM)
+
+            # ── Render name + marker on one line, tag appended inline ──────
+            marker = ">" if is_me else " "
+            suffix = " X" if not alive else (" <" if is_me else "")
+            name_str = (" " + marker + p["name"] + suffix)[: PWIDTH - 1]
+
+            if role_tag:
+                # Render name part, then tag immediately after on same row
+                name_col_end = len(name_str)
+                tag_str = " " + role_tag
+                # Truncate if combined exceeds panel
+                if name_col_end + len(tag_str) > PWIDTH:
+                    # Shorten name to fit tag
+                    name_str = name_str[: PWIDTH - len(tag_str) - 1]
+                    name_col_end = len(name_str)
+                self._put(stdscr, row, 0, name_str, name_attr)
+                self._put(stdscr, row, name_col_end, tag_str[: PWIDTH - name_col_end], tag_attr)
+            else:
+                self._put(stdscr, row, 0, name_str[: PWIDTH], name_attr)
+            row += 1
 
         # Vote tally (day only) — show target counts, skips, and who voted
         if phase == PHASE_DAY:
@@ -1082,9 +1104,9 @@ class MafiaClient:
                 full       = prefix + text
                 name_attr  = curses.color_pair(C_GREY) | curses.A_DIM
             elif ch == CH_MAFIA:
-                prefix     = "[MAFIA] " + author + ": "
+                prefix     = author + ": "
                 full       = prefix + text
-                name_attr  = curses.color_pair(C_RED) | curses.A_BOLD
+                name_attr  = curses.color_pair(C_RED)   # no A_BOLD — keeps dark red
             else:
                 # Town chat — colour the name by the author's role as seen by THIS viewer
                 prefix     = author + ": "
